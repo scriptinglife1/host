@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"syscall"
@@ -23,6 +24,7 @@ import (
 	"periph.io/x/conn/v3/gpio/gpioreg"
 	"periph.io/x/conn/v3/physic"
 	"periph.io/x/conn/v3/uart"
+	"periph.io/x/conn/v3/uart/uartreg"
 )
 
 // Enumerate returns the available serial buses as exposed by the OS.
@@ -49,14 +51,14 @@ func Enumerate() ([]int, error) {
 	return out, nil
 }
 
-func newPortDevFs(portNumber int) (*Port, error) {
+func newPortCloserDevFs(name string) (uart.PortCloser, error) {
 	// Use the devfs path for now.
-	name := fmt.Sprintf("ttyS%d", portNumber)
-	f, err := os.OpenFile("/dev/"+name, os.O_RDWR|syscall.O_NOCTTY, os.ModeExclusive)
+
+	f, err := os.OpenFile(name, os.O_RDWR|syscall.O_NOCTTY, os.ModeExclusive)
 	if err != nil {
 		return nil, err
 	}
-	p := &Port{serialConn{name: name, f: f, portNumber: portNumber}}
+	p := &Port{serialConn{name: name, f: f, portNumber: -1}}
 	return p, nil
 }
 
@@ -276,7 +278,38 @@ func (d *driverSerial) After() []string {
 }
 
 func (d *driverSerial) Init() (bool, error) {
+	prefixes := []string{"/dev/ttyS", "/dev/ttyUSB", "/dev/ttyA"}
+	items := make([]string, 0)
+	for _, prefix := range prefixes {
+		itemForPrefix, err := filepath.Glob(prefix + "*")
+		if err != nil {
+			return true, err
+		}
+		items = append(items, itemForPrefix...)
+	}
+
+	if len(items) == 0 {
+		return false, errors.New("no uart devices found")
+	}
+	// Make sure they are registered in order.
+	sort.Strings(items)
+	for _, item := range items {
+		//TODO: do we want to set a port number?
+		if err := uartreg.Register(item, []string{}, -1, openerUart(item).Open); err != nil {
+			return true, err
+		}
+	}
 	return true, nil
+}
+
+type openerUart string
+
+func (o openerUart) Open() (uart.PortCloser, error) {
+	b, err := newPortCloserDevFs(string(o))
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func init() {
