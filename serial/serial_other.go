@@ -7,4 +7,4 @@
 
 package serial
 
-var acceptedBauds [][2]uint32
+var acceptedBauds map[uint32]uint32

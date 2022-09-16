@@ -13,10 +13,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"sync"
 	"syscall"
+	"unsafe"
 
 	"periph.io/x/conn/v3"
 	"periph.io/x/conn/v3/driver/driverreg"
@@ -27,34 +30,123 @@ import (
 	"periph.io/x/conn/v3/uart/uartreg"
 )
 
-// Enumerate returns the available serial buses as exposed by the OS.
-//
-// TODO(maruel): Port number are likely not useful, we need port names.
-func Enumerate() ([]int, error) {
-	var out []int
-	if !isWindows {
-		// Do not use "/sys/class/tty/ttyS0/" as these are all owned by root.
-		prefix := "/dev/ttyS"
-		items, err := filepath.Glob(prefix + "*")
-		if err != nil {
-			return nil, err
-		}
-		out = make([]int, 0, len(items))
-		for _, item := range items {
-			i, err := strconv.Atoi(item[len(prefix):])
-			if err != nil {
-				continue
-			}
-			out = append(out, i)
-		}
+var baudrateMap = map[int]uint32{
+	0:       syscall.B9600, // Default to 9600
+	50:      syscall.B50,
+	75:      syscall.B75,
+	110:     syscall.B110,
+	134:     syscall.B134,
+	150:     syscall.B150,
+	200:     syscall.B200,
+	300:     syscall.B300,
+	600:     syscall.B600,
+	1200:    syscall.B1200,
+	1800:    syscall.B1800,
+	2400:    syscall.B2400,
+	4800:    syscall.B4800,
+	9600:    syscall.B9600,
+	19200:   syscall.B19200,
+	38400:   syscall.B38400,
+	57600:   syscall.B57600,
+	115200:  syscall.B115200,
+	230400:  syscall.B230400,
+	460800:  syscall.B460800,
+	500000:  syscall.B500000,
+	576000:  syscall.B576000,
+	921600:  syscall.B921600,
+	1000000: syscall.B1000000,
+	1152000: syscall.B1152000,
+	1500000: syscall.B1500000,
+	2000000: syscall.B2000000,
+	2500000: syscall.B2500000,
+	3000000: syscall.B3000000,
+	3500000: syscall.B3500000,
+	4000000: syscall.B4000000,
+}
+
+var databitsMap = map[int]uint32{
+	0: syscall.CS8, // Default to 8 bits
+	5: syscall.CS5,
+	6: syscall.CS6,
+	7: syscall.CS7,
+	8: syscall.CS8,
+}
+
+func setTermSettingsBaudrate(baudrate uint32, settings *syscall.Termios) error {
+	// revert old baudrate
+	for _, rate := range acceptedBauds {
+		settings.Cflag &^= rate
 	}
-	return out, nil
+	// set new baudrate
+	settings.Cflag |= baudrate
+	settings.Ispeed = baudrate
+	settings.Ospeed = baudrate
+	return nil
+}
+
+func setTermSettingsParity(parity uart.Parity, settings *syscall.Termios) error {
+	switch parity {
+	case uart.NoParity:
+		settings.Cflag &^= syscall.PARENB
+		settings.Cflag &^= syscall.PARODD
+		settings.Iflag &^= syscall.INPCK
+	case uart.Odd:
+		settings.Cflag |= syscall.PARENB
+		settings.Cflag |= syscall.PARODD
+		settings.Iflag |= syscall.INPCK
+	case uart.Even:
+		settings.Cflag |= syscall.PARENB
+		settings.Cflag &^= syscall.PARODD
+		settings.Iflag |= syscall.INPCK
+	case uart.Mark:
+		return errors.New("sysfs-uart: mark parity is not supported")
+	case uart.Space:
+		return errors.New("sysfs-uart: space parity is not supported")
+	default:
+		return fmt.Errorf("sysfs-uart: invalid parity %d", parity)
+	}
+	return nil
+}
+
+func setTermSettingsDataBits(bits int, settings *syscall.Termios) error {
+	databits, ok := databitsMap[bits]
+	if !ok {
+		return fmt.Errorf("sysfs-uart: invalid data bits %d", bits)
+	}
+	// Remove previous databits setting
+	settings.Cflag &^= syscall.CSIZE
+	// Set requested databits
+	settings.Cflag |= databits
+	return nil
+}
+
+func setTermSettingsStopBits(bits uart.Stop, settings *syscall.Termios) error {
+	switch bits {
+	case uart.One:
+		settings.Cflag &^= syscall.CSTOPB
+	case uart.OneHalf:
+		return fmt.Errorf("sysfs-uart: invalid data bits %d", bits)
+	case uart.Two:
+		settings.Cflag |= syscall.CSTOPB
+	default:
+		return fmt.Errorf("sysfs-uart: invalid data bits %d", bits)
+	}
+	return nil
+}
+
+func ioctl(f uintptr, op uint, arg uintptr) error {
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f, uintptr(op), arg); errno != 0 {
+		return syscall.Errno(errno)
+	}
+	return nil
 }
 
 func newPortCloserDevFs(name string) (uart.PortCloser, error) {
+	// TODO: set port number
 	// Use the devfs path for now.
 
-	f, err := os.OpenFile(name, os.O_RDWR|syscall.O_NOCTTY, os.ModeExclusive)
+	f, err := os.OpenFile(name, os.O_RDWR|syscall.O_NOCTTY|syscall.O_NONBLOCK, os.ModeExclusive)
+	syscall.SetNonblock(int(f.Fd()), false)
 	if err != nil {
 		return nil, err
 	}
@@ -85,32 +177,58 @@ func (p *Port) Connect(f physic.Frequency, stopBit uart.Stop, parity uart.Parity
 		return nil, fmt.Errorf("sysfs-uart: invalid speed %s; maximum supported clock is 1GHz", f)
 	}
 	if f < 50*physic.Hertz {
-		return nil, fmt.Errorf("sysfs-uart: invalid speed %s; minimum supported clock is 50Hz; did you forget to multiply by physic.KiloHertz?", f)
+		return nil, fmt.Errorf("sysfs-uart: invalid speed %s; minimum supported clock is 50Hz; did you forget to multiply by physic.Hertz?", f)
 	}
 	if bits < 5 || bits > 8 {
 		return nil, fmt.Errorf("sysfs-uart: invalid bits %d; must be between 5 and 8", bits)
 	}
 
-	// Find the closest value in acceptedBauds.
+	settings, err := p.getTermSettings()
+	if err != nil {
+		return nil, err
+	}
 	baud := uint32(f / physic.Hertz)
-	//var op uint32
-	for _, line := range acceptedBauds {
-		if line[0] > baud {
-			break
-		}
-		//op = line[1]
+
+	baudRateTermios, ok := acceptedBauds[baud]
+	if !ok {
+		return nil, fmt.Errorf("sysfs-uart: invalid baud rate", f)
 	}
 
 	p.conn.mu.Lock()
 	defer p.conn.mu.Unlock()
+
 	if p.conn.f == nil {
 		return nil, errors.New("sysfs-uart: already closed")
 	}
 	if p.conn.connected {
 		return nil, errors.New("sysfs-uart: already connected")
 	}
+	err = setTermSettingsBaudrate(baudRateTermios, settings)
+	if err != nil {
+		return nil, err
+	}
 	p.conn.freqConn = f
+
+	err = setTermSettingsDataBits(bits, settings)
+	if err != nil {
+		return nil, err
+	}
 	p.conn.bitsPerWord = uint8(bits)
+
+	err = setTermSettingsParity(parity, settings)
+	if err != nil {
+		return nil, err
+	}
+
+	err = setTermSettingsStopBits(stopBit, settings)
+	if err != nil {
+		return nil, err
+	}
+
+	if flow != uart.NoFlow {
+		return nil, errors.New("sysfs-uart: only no flow control is currently supported")
+	}
+
 	if flow != uart.RTSCTS {
 		p.conn.muPins.Lock()
 		p.conn.rts = gpio.INVALID
@@ -118,7 +236,10 @@ func (p *Port) Connect(f physic.Frequency, stopBit uart.Stop, parity uart.Parity
 		p.conn.muPins.Unlock()
 	}
 
-	// TODO(maruel): ioctl with flags and op.
+	err = p.setTermSettings(settings)
+	if err != nil {
+		return nil, err
+	}
 
 	return &p.conn, nil
 }
@@ -155,6 +276,18 @@ func (p *Port) RTS() gpio.PinOut {
 // CTS implements uart.Pins.
 func (p *Port) CTS() gpio.PinIn {
 	return p.conn.CTS()
+}
+
+func (p *Port) getTermSettings() (*syscall.Termios, error) {
+	var value syscall.Termios
+	err := ioctl(p.conn.f.Fd(), syscall.TCGETS, uintptr(unsafe.Pointer(&value)))
+	return &value, err
+}
+
+func (p *Port) setTermSettings(settings *syscall.Termios) error {
+	err := ioctl(p.conn.f.Fd(), syscall.TCSETS, uintptr(unsafe.Pointer(settings)))
+	runtime.KeepAlive(settings)
+	return err
 }
 
 type serialConn struct {
@@ -294,8 +427,20 @@ func (d *driverSerial) Init() (bool, error) {
 	// Make sure they are registered in order.
 	sort.Strings(items)
 	for _, item := range items {
-		//TODO: do we want to set a port number?
-		if err := uartreg.Register(item, []string{}, -1, openerUart(item).Open); err != nil {
+		port := -1
+		//todo change to A
+		r, err := regexp.Compile(`/dev/ttyUSB([\d]+)`)
+		if err != nil {
+			return true, err
+		}
+		matches := r.FindStringSubmatch(item)
+		if len(matches) == 2 {
+			port, err = strconv.Atoi(matches[1])
+			if err != nil {
+				return true, err
+			}
+		}
+		if err := uartreg.Register(item, []string{}, port, openerUart(item).Open); err != nil {
 			return true, err
 		}
 	}
