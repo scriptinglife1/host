@@ -72,6 +72,44 @@ var databitsMap = map[int]uint32{
 	8: syscall.CS8,
 }
 
+func setRawMode(settings *syscall.Termios) {
+	// Set local mode
+	settings.Cflag |= syscall.CREAD
+	settings.Cflag |= syscall.CLOCAL
+
+	// Set raw mode
+	settings.Lflag &^= syscall.ICANON
+	settings.Lflag &^= syscall.ECHO
+	settings.Lflag &^= syscall.ECHOE
+	settings.Lflag &^= syscall.ECHOK
+	settings.Lflag &^= syscall.ECHONL
+	settings.Lflag &^= syscall.ECHOCTL
+	settings.Lflag &^= syscall.ECHOPRT
+	settings.Lflag &^= syscall.ECHOKE
+	settings.Lflag &^= syscall.ISIG
+	settings.Lflag &^= syscall.IEXTEN
+
+	settings.Iflag &^= syscall.IXON
+	settings.Iflag &^= syscall.IXOFF
+	settings.Iflag &^= syscall.IXANY
+	settings.Iflag &^= syscall.INPCK
+	settings.Iflag &^= syscall.IGNPAR
+	settings.Iflag &^= syscall.PARMRK
+	settings.Iflag &^= syscall.ISTRIP
+	settings.Iflag &^= syscall.IGNBRK
+	settings.Iflag &^= syscall.BRKINT
+	settings.Iflag &^= syscall.INLCR
+	settings.Iflag &^= syscall.IGNCR
+	settings.Iflag &^= syscall.ICRNL
+	settings.Iflag &^= syscall.IUCLC
+
+	settings.Oflag &^= syscall.OPOST
+
+	// Block reads until at least one char is available (no timeout)
+	settings.Cc[syscall.VMIN] = 1
+	settings.Cc[syscall.VTIME] = 0
+}
+
 func setTermSettingsBaudrate(baudrate uint32, settings *syscall.Termios) error {
 	// revert old baudrate
 	for _, rate := range acceptedBauds {
@@ -172,7 +210,7 @@ func (p *Port) String() string {
 }
 
 // Connect implements uart.Port.
-func (p *Port) Connect(f physic.Frequency, stopBit uart.Stop, parity uart.Parity, flow uart.Flow, bits int) (conn.Conn, error) {
+func (p *Port) Connect(f physic.Frequency, stopBit uart.Stop, parity uart.Parity, flow uart.Flow, bits int) (uart.Conn, error) {
 	if f > physic.GigaHertz {
 		return nil, fmt.Errorf("sysfs-uart: invalid speed %s; maximum supported clock is 1GHz", f)
 	}
@@ -203,6 +241,9 @@ func (p *Port) Connect(f physic.Frequency, stopBit uart.Stop, parity uart.Parity
 	if p.conn.connected {
 		return nil, errors.New("sysfs-uart: already connected")
 	}
+
+	setRawMode(settings)
+
 	err = setTermSettingsBaudrate(baudRateTermios, settings)
 	if err != nil {
 		return nil, err
